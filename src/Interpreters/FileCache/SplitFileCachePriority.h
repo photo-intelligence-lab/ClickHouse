@@ -138,6 +138,12 @@ protected:
         getPriority(SegmentType::System).setInvalidateNotifier(threshold, on_invalidate);
     }
 
+    void setBatchPriorityIncrease(bool value) override
+    {
+        getPriority(SegmentType::Data).setBatchPriorityIncrease(value);
+        getPriority(SegmentType::System).setBatchPriorityIncrease(value);
+    }
+
     size_t removeInvalidatedEntries(size_t max_batch) override
     {
         size_t removed = getPriority(SegmentType::Data).removeInvalidatedEntries(max_batch);

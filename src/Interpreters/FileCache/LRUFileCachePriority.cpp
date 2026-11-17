@@ -143,7 +143,7 @@ IFileCachePriority::IteratorPtr LRUFileCachePriority::addForRestore( /// NOLINT
 
 LRUFileCachePriority::LRUIterator LRUFileCachePriority::add(
     EntryPtr entry,
-    const CachePriorityGuard::WriteLock &,
+    const CachePriorityGuard::WriteLock & lock,
     const CacheStateGuard::Lock * state_lock)
 {
     if (entry->size && !state_lock)
@@ -153,6 +153,9 @@ LRUFileCachePriority::LRUIterator LRUFileCachePriority::add(
             "Adding non-zero size entry without state lock "
             "(key: {}, offset: {})", entry->key, entry->offset);
     }
+
+    /// Earlier hits must end up before the new entry.
+    applyPendingPriorityIncreases(lock);
 
 #ifndef NDEBUG
     for (const auto & queue_entry : queue)
@@ -319,7 +322,10 @@ size_t LRUFileCachePriority::removeInvalidatedEntries(size_t max_batch)
             if (auto entry = ref.entry.lock(); entry && entry->getState() == Entry::State::Invalidated)
             {
                 if (!lock)
+                {
                     lock.emplace(getPriorityGuard().writeLock());
+                    applyPendingPriorityIncreases(*lock);
+                }
 
                 /// The entry could have been removed while the lock was being acquired.
                 if (entry->getState() == Entry::State::Invalidated)
@@ -695,6 +701,13 @@ LRUFileCachePriority::LRUIterator LRUFileCachePriority::move(
 IFileCachePriority::PriorityDumpPtr LRUFileCachePriority::dump()
 {
     assertNotSealed("dump");
+    {
+        /// The caller wants the exact order, so apply all the batches.
+        auto write_lock = getPriorityGuard().writeLock();
+        while (applyPendingPriorityIncreases(write_lock))
+        {
+        }
+    }
     auto lock = getPriorityGuard().readLock();
     std::vector<FileSegmentInfo> res;
     FileCacheReserveStat stat{};
@@ -753,24 +766,99 @@ bool LRUFileCachePriority::tryIncreasePriority(
     CacheStateGuard &)
 {
     assertNotSealed("tryIncreasePriority");
-    /// Best-effort promotion: skip rather than block if the (per-priority) guard is contended.
-    auto lock = getPriorityGuard().tryWriteLock();
-    if (!lock.owns_lock())
-        return false;
 
     const auto & entry = iterator.getEntry();
     chassert(entry->getState() == Entry::State::Active);
 
-    auto it = dynamic_cast<const LRUFileCachePriority::LRUIterator &>(iterator).get();
-    moveEvictionPosIfEqual(it, lock);
-    queue.splice(queue.end(), queue, it);
+    const auto & lru_iterator = dynamic_cast<const LRUFileCachePriority::LRUIterator &>(iterator);
+    chassert(lru_iterator.cache_priority == this);
+
+    const auto queue_iterator = lru_iterator.get();
+    const bool batch = batch_priority_increase.load(std::memory_order_relaxed);
+    if (batch)
+    {
+        pending_priority_increases.createStripesIfNeeded();
+
+        /// Consecutive hits of a thread on one entry need one record. Compared only by address.
+        static thread_local const Entry * last_recorded_entry = nullptr;
+
+        const bool was_pending = entry->has_pending_priority_increase.load(std::memory_order_relaxed)
+            || entry->has_pending_priority_increase.exchange(true, std::memory_order_relaxed);
+        if (was_pending && last_recorded_entry == entry.get())
+            return true;
+
+        using AddResult = PendingPriorityIncreases<PendingPriorityIncrease>::AddResult;
+        const auto add_result = pending_priority_increases.tryAdd(PendingPriorityIncrease{entry, queue_iterator});
+        if (add_result == AddResult::Added)
+        {
+            last_recorded_entry = entry.get();
+            return true;
+        }
+
+        if (!was_pending)
+            entry->has_pending_priority_increase.store(false, std::memory_order_relaxed);
+
+        if (add_result == AddResult::Busy)
+            return false;
+    }
+
+    /// Best-effort: lose this increase rather than block if the guard is contended.
+    auto lock = getPriorityGuard().tryWriteLock();
+    if (!lock.owns_lock())
+        return false;
+
+    /// With batching the buffer of this thread is full: make room in it.
+    std::array<PendingPriorityIncrease, max_priority_increases_per_batch> increases;
+    size_t count = batch ? pending_priority_increases.takeOfCurrentThread(std::span(increases).first(increases.size() - 1)) : 0;
+    increases[count++] = PendingPriorityIncrease{entry, queue_iterator};
+    applyPriorityIncreases(std::span(increases).first(count), lock);
     return true;
+}
+
+void LRUFileCachePriority::applyPriorityIncrease(const PendingPriorityIncrease & increase, const CachePriorityGuard::WriteLock &)
+{
+    /// The iterator is valid while the entry is in the queue, and `remove` sets `Removed` under the write lock.
+    const auto entry = increase.entry.lock();
+    if (!entry)
+        return;
+
+    if (entry->getState() != Entry::State::Removed)
+    {
+        moveEvictionPosIfEqualImpl(increase.iterator);
+        queue.splice(queue.end(), queue, increase.iterator);
+    }
+    entry->has_pending_priority_increase.store(false, std::memory_order_relaxed);
+}
+
+void LRUFileCachePriority::applyPriorityIncreases(
+    std::span<const PendingPriorityIncrease> increases, const CachePriorityGuard::WriteLock & lock)
+{
+    std::lock_guard eviction_pos_lock(eviction_pos_mutex);
+    for (const auto & increase : increases)
+        applyPriorityIncrease(increase, lock);
+}
+
+size_t LRUFileCachePriority::applyPendingPriorityIncreases(const CachePriorityGuard::WriteLock & lock)
+{
+    std::array<PendingPriorityIncrease, max_priority_increases_per_batch> increases;
+    const size_t count = pending_priority_increases.take(increases);
+    applyPriorityIncreases(std::span(increases).first(count), lock);
+    return count;
 }
 
 IFileCachePriority::EntryPtr LRUFileCachePriority::LRUIterator::getEntry() const
 {
-    assertValid();
-    return entry.lock();
+    const bool is_iterator_valid = iterator != LRUQueue::iterator{};
+    auto entry_ptr = entry.lock();
+    if (!entry_ptr || !is_iterator_valid)
+    {
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Attempt to use invalid iterator (entry: {}, iterator: {})",
+            bool(entry_ptr), is_iterator_valid);
+    }
+    chassert(entry_ptr == *iterator);
+    return entry_ptr;
 }
 
 bool LRUFileCachePriority::LRUIterator::isValid(const CachePriorityGuard::WriteLock &) const
@@ -879,16 +967,7 @@ void LRUFileCachePriority::LRUIterator::decrementSize(size_t size)
 
 bool LRUFileCachePriority::LRUIterator::assertValid() const
 {
-    const bool is_iterator_valid = iterator != LRUQueue::iterator{};
-    auto entry_ptr = entry.lock();
-    if (!entry_ptr || !is_iterator_valid)
-    {
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "Attempt to use invalid iterator (entry: {}, iterator: {})",
-            bool(entry_ptr), is_iterator_valid);
-    }
-    chassert(entry_ptr == *iterator);
+    [[maybe_unused]] const auto valid_entry = getEntry();
     return true;
 }
 
@@ -1010,6 +1089,11 @@ void LRUFileCachePriority::setEvictionPos(EvictionCursor cursor, LRUQueue::itera
 void LRUFileCachePriority::moveEvictionPosIfEqual(LRUQueue::iterator it, const CachePriorityGuard::WriteLock &)
 {
     std::lock_guard lk(eviction_pos_mutex);
+    moveEvictionPosIfEqualImpl(it);
+}
+
+void LRUFileCachePriority::moveEvictionPosIfEqualImpl(LRUQueue::iterator it)
+{
     for (auto * pos : {&reserve_eviction_pos, &background_eviction_pos})
     {
         if (*pos != LRUQueue::iterator{} && *pos == it)

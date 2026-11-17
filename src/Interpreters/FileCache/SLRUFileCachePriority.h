@@ -136,6 +136,13 @@ protected:
         probationary_queue.setInvalidateNotifier(threshold, on_invalidate);
     }
 
+    void setBatchPriorityIncrease(bool value) override
+    {
+        IFileCachePriority::setBatchPriorityIncrease(value);
+        protected_queue.setBatchPriorityIncrease(value);
+        probationary_queue.setBatchPriorityIncrease(value);
+    }
+
     size_t removeInvalidatedEntries(size_t max_batch) override
     {
         size_t removed = protected_queue.removeInvalidatedEntries(max_batch);

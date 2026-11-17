@@ -38,6 +38,7 @@ namespace DB
  *
  *   ShardedMap shard mutexes | LRUFileCachePriority::eviction_pos_mutex
  *   | LRUFileCachePriority::invalidated_mutex | SLRUIterator::entry_mutex
+ *   | PendingPriorityIncreases stripe mutexes (taken under `eviction_pos_mutex`)
  *
  * The CacheStateGuard > CachePriorityGuard edge is exercised only by startup load (`add` takes the
  * queue write lock under the state lock) and by dynamic-resize entry removal and restore

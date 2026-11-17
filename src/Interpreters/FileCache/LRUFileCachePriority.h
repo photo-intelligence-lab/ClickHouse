@@ -4,10 +4,12 @@
 #include <list>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <Interpreters/FileCache/IFileCachePriority.h>
 #include <Interpreters/FileCache/CacheUsage.h>
 #include <Common/logger_useful.h>
 #include <Interpreters/FileCache/Guards.h>
+#include <Interpreters/FileCache/PendingPriorityIncreases.h>
 
 class FileCacheTest_MoveEvictionPos_Test;
 
@@ -221,6 +223,14 @@ private:
     /// Size of `invalidated_refs`, kept as an atomic so the background cleanup can skip
     /// this queue without taking `invalidated_mutex` when there is nothing to clean up.
     std::atomic<size_t> invalidated_count = 0;
+
+    struct PendingPriorityIncrease
+    {
+        std::weak_ptr<Entry> entry;
+        LRUQueue::iterator iterator;
+    };
+    PendingPriorityIncreases<PendingPriorityIncrease> pending_priority_increases;
+
     /// Id of the current priority queue.
     /// Used to find its eviction info in collected eviction info map
     /// (which contains eviction info for several priority queues).
@@ -279,6 +289,17 @@ private:
     void setEvictionPos(EvictionCursor cursor, LRUQueue::iterator it, const CachePriorityGuard::ReadLock &);
     /// Advance every cursor that points at `it` (which is about to be removed/spliced out).
     void moveEvictionPosIfEqual(LRUQueue::iterator it, const CachePriorityGuard::WriteLock &);
+    void moveEvictionPosIfEqualImpl(LRUQueue::iterator it) TSA_REQUIRES(eviction_pos_mutex);
+
+    /// Move the entry to the queue tail, unless it was removed from the queue in the meantime.
+    void applyPriorityIncrease(const PendingPriorityIncrease & increase, const CachePriorityGuard::WriteLock &)
+        TSA_REQUIRES(eviction_pos_mutex);
+    void applyPriorityIncreases(std::span<const PendingPriorityIncrease> increases, const CachePriorityGuard::WriteLock &);
+    /// Applies one batch of the pending increases and returns its size.
+    size_t applyPendingPriorityIncreases(const CachePriorityGuard::WriteLock &);
+
+    /// Bounds the time which an insert or the cleanup spends on it under the write lock.
+    static constexpr size_t max_priority_increases_per_batch = 64;
 };
 
 class LRUFileCachePriority::LRUIterator : public IFileCachePriority::Iterator

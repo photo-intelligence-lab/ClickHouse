@@ -125,6 +125,7 @@ namespace FileCacheSetting
     extern const FileCacheSettingsUInt64 bypass_cache_threshold;
     extern const FileCacheSettingsUInt64 cache_hits_threshold;
     extern const FileCacheSettingsBool allow_dynamic_cache_resize;
+    extern const FileCacheSettingsBool lru_batch_priority_increase;
     extern const FileCacheSettingsUInt64 dynamic_resize_lock_wait_ms;
     extern const FileCacheSettingsBool use_split_cache;
     extern const FileCacheSettingsDouble split_cache_ratio;
@@ -426,6 +427,7 @@ FileCache::FileCache(const std::string & cache_name, const FileCacheSettings & s
     LOG_DEBUG(log, "Using {} cache policy", settings[FileCacheSetting::cache_policy].value);
 
     supports_dynamic_resize = main_priority->supportsDynamicResize();
+    main_priority->setBatchPriorityIncrease(settings[FileCacheSetting::lru_batch_priority_increase]);
 
     main_priority->setOnEvictCallback([this](const FileSegment & segment, size_t disk_accounted_size, const String & user_id)
     {
@@ -2963,6 +2965,12 @@ void FileCache::applySettingsIfPossible(const FileCacheSettings & new_settings, 
     {
         expose_eviction_metrics_per_user.store(new_settings[FileCacheSetting::expose_prometheus_eviction_metrics_per_user], std::memory_order_relaxed);
         actual_settings[FileCacheSetting::expose_prometheus_eviction_metrics_per_user] = new_settings[FileCacheSetting::expose_prometheus_eviction_metrics_per_user];
+    }
+
+    if (new_settings[FileCacheSetting::lru_batch_priority_increase] != actual_settings[FileCacheSetting::lru_batch_priority_increase])
+    {
+        main_priority->setBatchPriorityIncrease(new_settings[FileCacheSetting::lru_batch_priority_increase]);
+        actual_settings[FileCacheSetting::lru_batch_priority_increase] = new_settings[FileCacheSetting::lru_batch_priority_increase];
     }
 }
 

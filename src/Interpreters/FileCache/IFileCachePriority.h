@@ -65,6 +65,9 @@ public:
 
         std::atomic<size_t> size;
 
+        /// Set by a cache hit whose move to the queue tail is recorded but not applied yet.
+        std::atomic<bool> has_pending_priority_increase = false;
+
         std::string toString(const std::string & prefix = "") const;
 
         /// Locks `key_metadata`, throwing if it expired.
@@ -373,6 +376,9 @@ public:
         invalidate_notifier = on_invalidate;
     }
 
+    /// See the `lru_batch_priority_increase` cache setting. Wrappers propagate it down.
+    virtual void setBatchPriorityIncrease(bool value) { batch_priority_increase.store(value, std::memory_order_relaxed); }
+
     /// Remove up to `max_batch` invalidated entries (driven by `FileCache`'s cleanup task), each
     /// under its owning queue's write lock so cleanup serializes with foreground operations.
     /// Returns the number removed.
@@ -496,6 +502,8 @@ protected:
     /// Fire `invalidate_notifier` once a queue accumulates this many pending invalidated entries.
     std::atomic<size_t> invalidated_threshold = 0;
     std::function<void()> invalidate_notifier;
+
+    std::atomic<bool> batch_priority_increase = false;
 };
 
 using IFileCachePriorityPtr = std::unique_ptr<IFileCachePriority>;
