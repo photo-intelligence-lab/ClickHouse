@@ -313,6 +313,7 @@ const std::vector<Chart> & getCharts()
             {
                 {"BytesDownloaded", "sum(ProfileEvent_CacheWarmerBytesDownloaded)"},
                 {"DataPartsDownloaded", "sum(ProfileEvent_CacheWarmerDataPartsDownloaded)"},
+                {"DataPartsSkippedSameAvailabilityZone", "sum(ProfileEvent_CacheWarmerDataPartsSkippedSameAvailabilityZone)"},
                 {"BytesInProgress", "sum(CurrentMetric_CacheWarmerBytesInProgress)"},
             },
         },
